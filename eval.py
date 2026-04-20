@@ -104,8 +104,8 @@ if __name__ == '__main__':
         ["StreamingLLM"],
         ["H2O"],
         ["PyramidKV"],
-        ["CAM"],
         ["L2Norm"],
+        ["CAM"],
         ["ThinK"],
     ]
     
