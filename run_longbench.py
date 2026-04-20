@@ -229,6 +229,63 @@ def get_kv_cache_size_mb(past_key_values):
 
     return total_bytes / (1024 ** 2)
 
+from transformers.cache_utils import (
+    QuantizedCache,
+    QuantizedCacheConfig,
+)
+
+
+def tensor_nbytes(x):
+    if isinstance(x, torch.Tensor):
+        return x.numel() * x.element_size()
+    return 0
+
+def recursive_nbytes(obj, seen=None):
+    if seen is None:
+        seen = set()
+
+    obj_id = id(obj)
+    if obj_id in seen:
+        return 0
+    seen.add(obj_id)
+
+    # torch tensor
+    if isinstance(obj, torch.Tensor):
+        return obj.numel() * obj.element_size()
+
+    # basic containers
+    if isinstance(obj, dict):
+        return sum(recursive_nbytes(v, seen) for v in obj.values())
+    if isinstance(obj, (list, tuple, set)):
+        return sum(recursive_nbytes(v, seen) for v in obj)
+
+    # objects with __dict__
+    if hasattr(obj, "__dict__"):
+        return sum(recursive_nbytes(v, seen) for v in vars(obj).values())
+
+    return 0
+
+
+def get_cache_storage_bytes(past_key_values):
+    out = {}
+
+    # 1) 统计整个对象递归包含的 tensor bytes
+    out["total_recursive_bytes"] = recursive_nbytes(past_key_values)
+
+    # 2) 单独看 residual cache
+    key_cache = getattr(past_key_values, "key_cache", None)
+    value_cache = getattr(past_key_values, "value_cache", None)
+    if key_cache is not None or value_cache is not None:
+        out["residual_bytes"] = recursive_nbytes(key_cache) + recursive_nbytes(value_cache)
+
+    # 3) 单独看 quantized cache
+    qk = getattr(past_key_values, "_quantized_key_cache", None)
+    qv = getattr(past_key_values, "_quantized_value_cache", None)
+    if qk is not None or qv is not None:
+        out["quantized_bytes"] = recursive_nbytes(qk) + recursive_nbytes(qv)
+
+    return out
+
 @torch.no_grad()
 def generate_none_quant(
     i,
@@ -357,62 +414,120 @@ def generate_none_quant(
     }
 
 
-from transformers.cache_utils import (
-    QuantizedCache,
-    QuantizedCacheConfig,
-)
+@torch.no_grad()
+def generate_none_bench(
+    model,
+    tokenizer,
+    input_ids,
+    attention_mask,
+    max_new_tokens,
+    eos_token_id,
+    output_attentions=False,
+):
+    """
+    Non-quantized KV cache benchmark using the same generate() path
+    as generate_quant_bench.
 
+    Measures:
+        - TTFT (time to first token)
+        - TPOT (per token latency)
+        - GPU memory usage
 
-def tensor_nbytes(x):
-    if isinstance(x, torch.Tensor):
-        return x.numel() * x.element_size()
-    return 0
+    Assumes:
+        batch_size == 1
+    """
+    device = input_ids.device
+    assert input_ids.size(0) == 1, "This implementation assumes batch_size = 1"
 
-def recursive_nbytes(obj, seen=None):
-    if seen is None:
-        seen = set()
+    # =======================
+    # Streamer
+    # =======================
+    streamer = TextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True,
+    )
 
-    obj_id = id(obj)
-    if obj_id in seen:
-        return 0
-    seen.add(obj_id)
+    token_latencies = []
+    token_mem = []
+    token_mem_reserved = []
 
-    # torch tensor
-    if isinstance(obj, torch.Tensor):
-        return obj.numel() * obj.element_size()
+    # =======================
+    # Reset GPU memory stats
+    # =======================
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
 
-    # basic containers
-    if isinstance(obj, dict):
-        return sum(recursive_nbytes(v, seen) for v in obj.values())
-    if isinstance(obj, (list, tuple, set)):
-        return sum(recursive_nbytes(v, seen) for v in obj)
+    generation_kwargs = dict(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        num_beams=1,
+        do_sample=False,
+        temperature=1.0,
+        min_length=input_ids.shape[1] + 1,
+        eos_token_id=eos_token_id,
+        output_attentions=output_attentions,
+        streamer=streamer,
+        use_cache=True,                    # 明确打开普通 KV cache
+        return_dict_in_generate=True,
+        # 不设置 cache_implementation / cache_config
+    )
 
-    # objects with __dict__
-    if hasattr(obj, "__dict__"):
-        return sum(recursive_nbytes(v, seen) for v in vars(obj).values())
+    result_container = {}
 
-    return 0
+    def run_generate():
+        result_container["output"] = model.generate(**generation_kwargs)
 
+    # =======================
+    # Start generation
+    # =======================
+    generate_start = time.perf_counter()
+    thread = threading.Thread(target=run_generate)
+    thread.start()
 
-def get_cache_storage_bytes(past_key_values):
-    out = {}
+    first_token_latency = None
+    last_time = None
 
-    # 1) 统计整个对象递归包含的 tensor bytes
-    out["total_recursive_bytes"] = recursive_nbytes(past_key_values)
+    # =======================
+    # Stream tokens
+    # =======================
+    for _ in streamer:
+        torch.cuda.synchronize()
+        now = time.perf_counter()
 
-    # 2) 单独看 residual cache
-    key_cache = getattr(past_key_values, "key_cache", None)
-    value_cache = getattr(past_key_values, "value_cache", None)
-    if key_cache is not None or value_cache is not None:
-        out["residual_bytes"] = recursive_nbytes(key_cache) + recursive_nbytes(value_cache)
+        if first_token_latency is None:
+            first_token_latency = now - generate_start
+        else:
+            latency = now - last_time
+            token_latencies.append(latency)
 
-    # 3) 单独看 quantized cache
-    qk = getattr(past_key_values, "_quantized_key_cache", None)
-    qv = getattr(past_key_values, "_quantized_value_cache", None)
-    if qk is not None or qv is not None:
-        out["quantized_bytes"] = recursive_nbytes(qk) + recursive_nbytes(qv)
+        token_mem.append(torch.cuda.memory_allocated())
+        token_mem_reserved.append(torch.cuda.memory_reserved())
 
-    return out
+        last_time = now
+
+    thread.join()
+
+    out = result_container["output"]
+    sequences = out.sequences
+    pkv = out.past_key_values
+
+    # 非量化普通 cache 的统计
+    kv_cache_size_mb = get_kv_cache_size_mb(pkv)
+
+    return {
+        "sequences": sequences,
+        "time_to_first_token": first_token_latency,
+        "token_latencies": token_latencies,
+        "token_mem": token_mem,
+        "token_mem_reserved": token_mem_reserved,
+        "mem_peak": torch.cuda.max_memory_allocated(),
+        "mem_reserved_peak": torch.cuda.max_memory_reserved(),
+        "kv_cache_size_mb": kv_cache_size_mb,
+        "past_key_values": pkv,   # 可选，调试时保留
+    }
+
 
 @torch.no_grad()
 def generate_quant_bench(
@@ -785,8 +900,16 @@ def main(args):
                 #     min_length=context_length+1,
                 #     eos_token_id=[tokenizer.eos_token_id]
                 # )
-                gen_out = generate_none_quant(
-                    i,
+                # gen_out = generate_none_quant(
+                #     i,
+                #     model=model,
+                #     input_ids=batch_input_ids,
+                #     attention_mask=attention_mask,
+                #     max_new_tokens=output_max_len,
+                #     eos_token_id=[tokenizer.eos_token_id],
+                #     output_attentions=args.output_attentions,
+                # )
+                gen_out = generate_none_bench(
                     model=model,
                     input_ids=batch_input_ids,
                     attention_mask=attention_mask,
