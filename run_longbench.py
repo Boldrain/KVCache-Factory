@@ -18,10 +18,7 @@ from collections import Counter
 # GPU 监控类
 class GPUMonitor:
     def __init__(self, interval=0.01, gpu_id=0):
-        """
-        interval: 采样间隔（秒），0.01 = 10ms
-        gpu_id: GPU 编号
-        """
+
         self.interval = interval
         self.gpu_id = gpu_id
 
@@ -49,11 +46,11 @@ class GPUMonitor:
 
     def _sample_loop(self):
         while not self._stop_event.is_set():
-            # 显存（bytes）
+            # 显存
             mem = torch.cuda.memory_allocated()
             self.mem_samples.append(mem)
 
-            # 功耗（W）
+            # 功耗
             power = self._get_power()
             if power is not None:
                 self.power_samples.append(power)
@@ -269,16 +266,13 @@ def recursive_nbytes(obj, seen=None):
 def get_cache_storage_bytes(past_key_values):
     out = {}
 
-    # 1) 统计整个对象递归包含的 tensor bytes
     out["total_recursive_bytes"] = recursive_nbytes(past_key_values)
 
-    # 2) 单独看 residual cache
     key_cache = getattr(past_key_values, "key_cache", None)
     value_cache = getattr(past_key_values, "value_cache", None)
     if key_cache is not None or value_cache is not None:
         out["residual_bytes"] = recursive_nbytes(key_cache) + recursive_nbytes(value_cache)
 
-    # 3) 单独看 quantized cache
     qk = getattr(past_key_values, "_quantized_key_cache", None)
     qv = getattr(past_key_values, "_quantized_value_cache", None)
     if qk is not None or qv is not None:
@@ -301,9 +295,7 @@ def generate_none_quant(
     batch_size = input_ids.size(0)
     assert batch_size == 1, "This implementation assumes batch_size = 1"
 
-    # =======================
-    # Prefill
-    # =======================
+
     prefill_start = time.perf_counter()
 
     outputs = model(
@@ -319,29 +311,23 @@ def generate_none_quant(
     past_key_values = outputs.past_key_values
     logits = outputs.logits[:, -1, :]  # [1, vocab]
 
-    # =======================
-    # Stats containers
-    # =======================
+
     generated_tokens = []
     token_latencies = []
     token_mem = []
     token_mem_reserved = []
 
-    # 当前 attention_mask（decode 时必须增长）
+
     cur_attention_mask = attention_mask
 
     torch.cuda.reset_peak_memory_stats()
 
-    # =======================
-    # Decode loop
-    # =======================
+
     for step in range(max_new_tokens):
         start = time.perf_counter()
 
-        # greedy
         next_token = torch.argmax(logits, dim=-1, keepdim=True)  # [1,1]
 
-        # 1️⃣ attention_mask 增长
         cur_attention_mask = torch.cat(
             [
                 cur_attention_mask,
@@ -354,8 +340,6 @@ def generate_none_quant(
             dim=1,
         )
 
-        # 2️⃣ position_ids 必须显式给
-        # 等价于 HF generate 的做法
         position_ids = torch.tensor(
             [[cur_attention_mask.shape[1] - 1]],
             device=device,
@@ -391,9 +375,7 @@ def generate_none_quant(
         if next_token.item() in eos_token_id:
             break
 
-    # =======================
-    # 拼接输出（与 HF generate 一致）
-    # =======================
+
     if generated_tokens:
         generated_tokens = torch.cat(generated_tokens, dim=1)
         sequences = torch.cat([input_ids, generated_tokens], dim=1)
@@ -424,24 +406,11 @@ def generate_none_bench(
     eos_token_id,
     output_attentions=False,
 ):
-    """
-    Non-quantized KV cache benchmark using the same generate() path
-    as generate_quant_bench.
 
-    Measures:
-        - TTFT (time to first token)
-        - TPOT (per token latency)
-        - GPU memory usage
-
-    Assumes:
-        batch_size == 1
-    """
     device = input_ids.device
     assert input_ids.size(0) == 1, "This implementation assumes batch_size = 1"
 
-    # =======================
-    # Streamer
-    # =======================
+
     streamer = TextIteratorStreamer(
         tokenizer,
         skip_prompt=True,
@@ -452,9 +421,7 @@ def generate_none_bench(
     token_mem = []
     token_mem_reserved = []
 
-    # =======================
-    # Reset GPU memory stats
-    # =======================
+
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
 
@@ -469,9 +436,8 @@ def generate_none_bench(
         eos_token_id=eos_token_id,
         output_attentions=output_attentions,
         streamer=streamer,
-        use_cache=True,                    # 明确打开普通 KV cache
+        use_cache=True,                
         return_dict_in_generate=True,
-        # 不设置 cache_implementation / cache_config
     )
 
     result_container = {}
@@ -479,9 +445,6 @@ def generate_none_bench(
     def run_generate():
         result_container["output"] = model.generate(**generation_kwargs)
 
-    # =======================
-    # Start generation
-    # =======================
     generate_start = time.perf_counter()
     thread = threading.Thread(target=run_generate)
     thread.start()
@@ -489,9 +452,7 @@ def generate_none_bench(
     first_token_latency = None
     last_time = None
 
-    # =======================
-    # Stream tokens
-    # =======================
+
     for _ in streamer:
         torch.cuda.synchronize()
         now = time.perf_counter()
@@ -513,7 +474,7 @@ def generate_none_bench(
     sequences = out.sequences
     pkv = out.past_key_values
 
-    # 非量化普通 cache 的统计
+
     kv_cache_size_mb = get_kv_cache_size_mb(pkv)
 
     return {
@@ -525,7 +486,7 @@ def generate_none_bench(
         "mem_peak": torch.cuda.max_memory_allocated(),
         "mem_reserved_peak": torch.cuda.max_memory_reserved(),
         "kv_cache_size_mb": kv_cache_size_mb,
-        "past_key_values": pkv,   # 可选，调试时保留
+        "past_key_values": pkv,   
     }
 
 
@@ -540,24 +501,11 @@ def generate_quant_bench(
     cache_config,
     output_attentions=False,
 ):
-    """
-    Quantized KV cache benchmark (single generate call)
-
-    Measures:
-        - TTFT (time to first token)
-        - TPOT (per token latency)
-        - GPU memory usage
-
-    Assumes:
-        batch_size == 1
-    """
 
     device = input_ids.device
     assert input_ids.size(0) == 1, "This implementation assumes batch_size = 1"
 
-    # =======================
-    # Streamer
-    # =======================
+
     streamer = TextIteratorStreamer(
         tokenizer,
         skip_prompt=True,
@@ -568,9 +516,7 @@ def generate_quant_bench(
     token_mem = []
     token_mem_reserved = []
 
-    # =======================
-    # Reset GPU memory stats
-    # =======================
+    # Reset
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
 
@@ -595,9 +541,6 @@ def generate_quant_bench(
     def run_generate():
         result_container["output"] = model.generate(**generation_kwargs)
 
-    # =======================
-    # Start generation
-    # =======================
     generate_start = time.perf_counter()
     thread = threading.Thread(target=run_generate)
     thread.start()
@@ -605,9 +548,7 @@ def generate_quant_bench(
     first_token_latency = None
     last_time = None
 
-    # =======================
     # Stream tokens
-    # =======================
     for _ in streamer:
         torch.cuda.synchronize()
         now = time.perf_counter()
@@ -659,7 +600,7 @@ def reset_pyramidkv_state(model):
     for layer in model.model.layers:
         attn = layer.self_attn
 
-        # 只 reset 你自己加的状态
+        
         if hasattr(attn, "kv_seq_len"):
             attn.kv_seq_len = 0
 
@@ -669,7 +610,7 @@ def reset_pyramidkv_state(model):
         if hasattr(attn, "prefill_phase"):
             attn.prefill_phase = True
 
-        # 如果 kv_cluster 有状态，也要清
+        
         if hasattr(attn, "kv_cluster"):
             if hasattr(attn.kv_cluster, "kv_seq_len"):
                 attn.kv_cluster.kv_seq_len = 0
@@ -900,16 +841,8 @@ def main(args):
                 #     min_length=context_length+1,
                 #     eos_token_id=[tokenizer.eos_token_id]
                 # )
-                # gen_out = generate_none_quant(
-                #     i,
-                #     model=model,
-                #     input_ids=batch_input_ids,
-                #     attention_mask=attention_mask,
-                #     max_new_tokens=output_max_len,
-                #     eos_token_id=[tokenizer.eos_token_id],
-                #     output_attentions=args.output_attentions,
-                # )
-                gen_out = generate_none_bench(
+                gen_out = generate_none_quant(
+                    i,
                     model=model,
                     input_ids=batch_input_ids,
                     attention_mask=attention_mask,
@@ -917,6 +850,14 @@ def main(args):
                     eos_token_id=[tokenizer.eos_token_id],
                     output_attentions=args.output_attentions,
                 )
+                # gen_out = generate_none_bench(
+                #     model=model,
+                #     input_ids=batch_input_ids,
+                #     attention_mask=attention_mask,
+                #     max_new_tokens=output_max_len,
+                #     eos_token_id=[tokenizer.eos_token_id],
+                #     output_attentions=args.output_attentions,
+                # )
                 
                 output = gen_out["sequences"]
                 token_latencies = gen_out["token_latencies"]
@@ -937,7 +878,7 @@ def main(args):
                 # )
                 gen_out = generate_quant_bench(
                     model=model,
-                    tokenizer=tokenizer,  # ⚠️ 多了这个参数
+                    tokenizer=tokenizer,  
                     input_ids=batch_input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=output_max_len,
